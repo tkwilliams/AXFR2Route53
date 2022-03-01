@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+'''
+This script allows transfer of DNS from an upstream DNS server via AXFR as
+defined in RFC 5936 and submits entries to Route 53 via boto3.  It uses the
+UPSERT action to either create a record or update the existing one.  You can
+use it to do a one time transfer of a type of record from the zone you need or
+perform a continual sync of DNS from an upstream server, like an Active
+Directory server, into a Route 53 privte zone without having to run/pay for the
+AWS Directory Service for Microsoft AD.  It is safe to run this more than once.
+
+The upstream DNS server must be set to allow AXFR requests.  You can test this
+by performing:  `dig AXFR yourdomain.com @<DNS_Server>`
+
+Usage:  ``./AXFR2Route53 -s 1.2.3.4 -d my.dns.example -z Z1234567891011 -t A``
+
+The above example will try a AXFR for my.dns.example aginst 1.2.3.4 for
+"A" records and send them to the Hosted zone Z1234567891011 in batches of
+100.
+'''
+
+import os
+import sys
+import argparse
+
+try:
+  import boto3
+except ImportError:
+  raise SystemExit("Please install boto3:  pip install boto3")
+
+try:
+  import dns.zone
+  import dns.query
+  import dns.rdataclass
+  import dns.rdatatype
+except ImportError:
+  raise SystemExit("Please install dnspython:  pip install dnspython")
+
+
+ME = os.path.basename(sys.argv[0])
+CHUNKS = 98
+
+
+class AXFR2Route53(object):
+  ''' Update Route53 with entries from upstream DNS Server '''
+  def __init__(self, options):
+    if options.verbose:
+      self.verbose = lambda *junk: print(*junk)
+    else:
+      self.verbose = lambda *junk: None
+    options.rrtypes = options.recordtypes.split(',')
+    self.options = options
+    self.update_records()
+
+  def update_records(self):
+    ''' Run route53 updates based on AXFR request '''
+    # performing axfr
+    self.verbose("Making AXFR request to %s..." % self.options.dnsserver)
+    axfr = dns.zone.from_xfr(dns.query.xfr(self.options.dnsserver, self.options.domain))
+    self.verbose("AXFR Request recieved a reply from the server.  Preparing to send to R53 Hoested Zone:  %s" % self.options.hostedzone)
+
+    dns_changes = []
+    adict = {}
+    self.verbose("Processing %s records for %s..." % (self.options.rrtypes, self.options.domain))
+    if not axfr.nodes:
+      raise SystemExit("No records found to process... is AXFR enabled on the DNS server you are pulling from?")
+    self.verbose("Total records downloaded:  %s" % len(axfr.nodes))
+    for rrtype in self.options.rrtypes:
+      if not rrtype in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'PTR', 'SPF', 'TXT', 'SRV'):
+        raise SystemExit("Unknown or unsupported record type in Route 53:  %s" % rrtype)
+
+    for rrtype in self.options.rrtypes:
+      for name, node in axfr.nodes.items():
+        rdataset = node.get_rdataset(rdclass=getattr(dns.rdataclass, rrtype), rdtype=dns.rdatatype.IN)
+        if rdataset:
+          for rds in rdataset:
+            if str(name) == "@":
+              continue
+            else:
+              recordname = '%s.%s' % (name, self.options.domain) if self.options.domain.endswith('.') else '%s.%s.' % (name, self.options.domain)
+              adict.setdefault(recordname, {})
+              adict[recordname].setdefault(rrtype, {'records': [], 'ttl': int(rdataset.ttl)})
+              adict[recordname][rrtype]['records'].append({'Value': str(rds)})
+
+    for name, rrtypes in adict.items():
+      for rrtype, thedict in rrtypes.items():
+        self.verbose("Processing type %s records..." % rrtype)
+        dns_changes.append(
+          {'Action': 'UPSERT',
+            'ResourceRecordSet': {
+              'Name': name,
+              'Type': getattr(dns.rdataclass, rrtype),
+              'TTL': thedict['ttl'],
+              'ResourceRecords': thedict['records']
+            }
+          }
+        )
+
+    if len(dns_changes) == 0:
+      raise SystemExit("No records processed...  Are there records of these types (%s) on the DNS server you are pulling from?" % self.options.rrtypes)
+    self.verbose("Total records processed:  %s" % len(dns_changes))
+
+    self.verbose("Connecting to Route53 via boto3...")
+    client = boto3.client('route53')
+    self.verbose("Breaking up records into batches of %s to send to Route53..." % ChUNKS)
+    chunks = [dns_changes[i * CHUNKS:(i + 1) * CHUNKS] for i in range((len(dns_changes) + CHUNKS - 1) // CHUNKS )]
+    count = 0
+    for chunk in chunks:
+      client.change_resource_record_sets(HostedZoneId=str(self.options.hostedzone), ChangeBatch={'Changes': chunk})
+      count += 1
+      self.verbose("Batch submitted to Route 53:  %s" % count)
+
+
+def parser_setup():
+  ''' Setup the options parser '''
+  parser = argparse.ArgumentParser(description='Perform an AXFR request against a DNS Server and submit the RRs to Route53.')
+  parser.add_argument('--domain', '-d', required=True, help='Domain to submit AXFR request for.')
+  parser.add_argument('--dnsserver', '-s', required=True, help='IP or FQDN of DNS server to send AXFR request to.')
+  parser.add_argument('--recordtypes', '-t', default='A,CNAME', help='Comma-separated list of RR type to process.  Default is `%(default)s`')
+  parser.add_argument('--comment', '-c', default='Managed by %s' % ME, help='Set Route53 record comment.  Default is `%(default)s`.')
+  parser.add_argument('--hostedzone', '-z', required=True, help='ID of Route53 Hosted zone to submit records to.')
+  parser.add_argument('--verbose', '-v', action='store_true', help='Be verbose during processing.')
+  return parser
+
+
+def main():
+  ''' Parse options and call main program '''
+  parser = parser_setup()
+  options = parser.parse_args()
+  AXFR2Route53(options)
+
+
+if __name__ == '__main__':
+  main()
+
+
+# vim: ts=2 sw=2 sts=2 et
